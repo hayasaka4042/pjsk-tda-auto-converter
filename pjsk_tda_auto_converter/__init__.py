@@ -1,7 +1,7 @@
 bl_info = {
     "name": "PJSK to TDA Auto Converter",
     "author": "hayasaka4042",
-    "version": (1, 2, 0),
+    "version": (1, 2, 1),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > PJSK→TDA",
     "description": "依實際骨名與 Rest Matrix，將 PJSK/MMD Action 轉換到常見 TDA 骨架",
@@ -19,10 +19,11 @@ import unicodedata
 
 import bpy
 from bpy.props import PointerProperty, StringProperty
-from mathutils import Matrix, Vector
+from mathutils import Matrix, Quaternion, Vector
 
 
 SOURCE_TEMPLATE_NAME = "PJSK_Source_Rig_TEMPLATE"
+TARGET_TEMPLATE_NAME = "TDA_Target_Rig_TEMPLATE"
 TEMPLATE_FILE = "pjsk_tda_rig_template.blend"
 MATRIX_GATE = 1.0e-4
 SCALE_GATE = 1.0e-5
@@ -45,7 +46,7 @@ OUTPUT_BONES = (
     "MiddleFinger3_L", "MiddleFinger3_R", "RingFinger3_L", "RingFinger3_R",
     "Thumb2_L", "Thumb2_R",
 )
-OPTIONAL_BONES = frozenset(("Dummy_L", "Dummy_R"))
+OPTIONAL_BONES = frozenset(("Eyes", "Dummy_L", "Dummy_R"))
 
 
 _BASE_BONE_ALIASES = {
@@ -209,8 +210,10 @@ def _resolve_bone_map(target):
                     continue
                 if source == "骨名" and label == canonical:
                     score = 0
-                elif unicodedata.normalize("NFKC", label).casefold() in alias_text_sets[canonical]:
+                elif source == "骨名":
                     score = 1
+                elif unicodedata.normalize("NFKC", label).casefold() in alias_text_sets[canonical]:
+                    score = 2
                 else:
                     score = 3
                 if best_score is None or score < best_score:
@@ -307,19 +310,22 @@ def _set_quaternion_modes(target, bone_map):
     return changed
 
 
-def _append_source_template(scene):
+def _append_templates(scene):
     path = os.path.join(os.path.dirname(__file__), TEMPLATE_FILE)
     if not os.path.isfile(path):
         raise ConversionError(f"找不到內建骨架模板：{path}")
+    requested = (SOURCE_TEMPLATE_NAME, TARGET_TEMPLATE_NAME)
     with bpy.data.libraries.load(path, link=False) as (data_from, data_to):
-        if SOURCE_TEMPLATE_NAME not in data_from.objects:
-            raise ConversionError(f"骨架模板缺少物件：{SOURCE_TEMPLATE_NAME}")
-        data_to.objects = [SOURCE_TEMPLATE_NAME]
-    source = data_to.objects[0]
-    scene.collection.objects.link(source)
-    source.hide_render = True
-    source.hide_set(True)
-    return source
+        missing = [name for name in requested if name not in data_from.objects]
+        if missing:
+            raise ConversionError("骨架模板缺少物件：" + ", ".join(missing))
+        data_to.objects = list(requested)
+    loaded = dict(zip(requested, data_to.objects))
+    for obj in loaded.values():
+        scene.collection.objects.link(obj)
+        obj.hide_render = True
+        obj.hide_set(True)
+    return loaded[SOURCE_TEMPLATE_NAME], loaded[TARGET_TEMPLATE_NAME]
 
 
 def _remove_object(obj):
@@ -435,10 +441,37 @@ def _write_curve(action, data_path, array_index, group_name, frames, values):
     curve.update()
 
 
-def _make_action(name, frames, channels, bone_map):
-    action = bpy.data.actions.new(name)
+def _make_action(
+    name, frames, channels, bone_map, input_action=None,
+    target_source_map=None,
+):
+    action = input_action.copy() if input_action is not None else bpy.data.actions.new(name)
+    action.name = name
     action.use_fake_user = True
     try:
+        if input_action is not None:
+            output_names = {bone_map[name] for name in _mapped_output_bones(bone_map)}
+            ik_source_names = {
+                "LegIKParent_L", "LegIKParent_R", "LegIK_L", "LegIK_R",
+                "ToeTipIK_L", "ToeTipIK_R",
+            }
+            pattern = re.compile(r'^pose\.bones\["(.*)"\]\.(.+)$')
+            for curve in list(action.fcurves):
+                match = pattern.match(curve.data_path)
+                bone_name = match.group(1) if match else None
+                suffix = match.group(2) if match else curve.data_path
+                source_name = (
+                    target_source_map.get(bone_name)
+                    if bone_name is not None and target_source_map is not None
+                    else None
+                )
+                if (
+                    bone_name in output_names
+                    or source_name in ik_source_names
+                    or suffix == "scale"
+                    or "mmd_ik_toggle" in suffix
+                ):
+                    action.fcurves.remove(curve)
         for bone_name in _mapped_output_bones(bone_map):
             actual_name = bone_map[bone_name]
             loc_path = _bone_data_path(actual_name, "location")
@@ -469,10 +502,51 @@ def _make_lower_action(name, frames, lower_channels, lower_body_name):
         raise
 
 
-def _capture_channels(context, source, target, frames, bone_map, target_source_map):
+def _vmd_axis_matrix(data_bone):
+    matrix = data_bone.matrix_local.to_3x3()
+    matrix[1], matrix[2] = matrix[2].copy(), matrix[1].copy()
+    return matrix.transposed()
+
+
+def _basis_between_rigs(basis, from_bone, to_bone):
+    from_axis = _vmd_axis_matrix(from_bone)
+    to_axis = _vmd_axis_matrix(to_bone)
+    location, quaternion, scale = basis.decompose()
+    from_quaternion = from_axis.to_quaternion()
+    to_quaternion = to_axis.to_quaternion()
+    vmd_location = from_axis.inverted() @ location
+    vmd_quaternion = (
+        from_quaternion.conjugated() @ quaternion @ from_quaternion
+    )
+    return Matrix.LocRotScale(
+        to_axis @ vmd_location,
+        (to_quaternion @ vmd_quaternion @ to_quaternion.conjugated()).normalized(),
+        scale,
+    )
+
+
+def _passthrough_bones(bridge, target, bone_map, target_source_map):
+    result = set()
+    for canonical in _mapped_output_bones(bone_map):
+        bridge_parent = bridge.data.bones[canonical].parent
+        target_parent = target.data.bones[bone_map[canonical]].parent
+        expected_parent = bridge_parent.name if bridge_parent else None
+        actual_parent = (
+            target_source_map.get(target_parent.name) if target_parent else None
+        )
+        if actual_parent != expected_parent:
+            result.add(canonical)
+    return frozenset(result)
+
+
+def _capture_channels(
+    context, source, bridge, target, input_action, frames, bone_map,
+    target_source_map, passthrough_bones,
+):
+    mapped_output_bones = _mapped_output_bones(bone_map)
     channels = {
         name: {"loc": [[], [], []], "quat": [[], [], [], []]}
-        for name in _mapped_output_bones(bone_map)
+        for name in mapped_output_bones
     }
     lower_channels = {"loc": [[], [], []], "quat": [[], [], [], []]}
     previous_quat = {}
@@ -480,41 +554,55 @@ def _capture_channels(context, source, target, frames, bone_map, target_source_m
     max_basis_scale_error = 0.0
     max_lower_matrix_error = 0.0
     worst_scale = (None, None)
+    target.animation_data_create()
+    target.animation_data.action = input_action
+    source.animation_data_create()
+    source.animation_data.action = None
+    bridge.animation_data_create()
+    bridge.animation_data.action = None
 
+    input_pairs = {
+        target_name: (source_name, target.data.bones[target_name], source.data.bones[source_name])
+        for target_name, source_name in target_source_map.items()
+    }
+    output_pairs = {
+        canonical: (
+            bridge.data.bones[canonical],
+            target.data.bones[bone_map[canonical]],
+        )
+        for canonical in mapped_output_bones
+    }
     window_manager = context.window_manager
+
     for index, frame in enumerate(frames):
         context.scene.frame_set(frame)
+        context.view_layer.update()
+        input_bases = {
+            canonical: target.pose.bones[bone_map[canonical]].matrix_basis.copy()
+            for canonical in mapped_output_bones
+        }
+        for pose_bone in source.pose.bones:
+            pose_bone.matrix_basis = Matrix.Identity(4)
+        for target_name, (source_name, target_bone, source_bone) in input_pairs.items():
+            source.pose.bones[source_name].matrix_basis = _basis_between_rigs(
+                target.pose.bones[target_name].matrix_basis,
+                target_bone,
+                source_bone,
+            )
         context.view_layer.update()
 
         source_pose = {bone.name: bone.matrix.copy() for bone in source.pose.bones}
         desired_pose = {}
-
-        def desired_for(target_bone):
-            cached = desired_pose.get(target_bone.name)
-            if cached is not None:
-                return cached
-            source_name = target_source_map.get(target_bone.name)
-            if source_name is not None:
-                source_rest = source.data.bones[source_name].matrix_local
-                desired = (
-                    target_bone.matrix_local
-                    @ source_rest.inverted()
-                    @ source_pose[source_name]
+        for bridge_bone in bridge.data.bones:
+            if bridge_bone.name in source_pose and bridge_bone.name in source.data.bones:
+                desired_pose[bridge_bone.name] = (
+                    bridge_bone.matrix_local
+                    @ source.data.bones[bridge_bone.name].matrix_local.inverted()
+                    @ source_pose[bridge_bone.name]
                 )
-            elif target_bone.parent:
-                parent_desired = desired_for(target_bone.parent)
-                parent_rest = target_bone.parent.matrix_local
-                desired = parent_desired @ parent_rest.inverted() @ target_bone.matrix_local
-            else:
-                desired = target_bone.matrix_local.copy()
-            desired_pose[target_bone.name] = desired
-            return desired
-
-        for target_bone in target.data.bones:
-            desired_for(target_bone)
 
         lower_matrix = source_pose["LowerBody"]
-        lower_loc, lower_quat, lower_scale = lower_matrix.decompose()
+        lower_loc, lower_quat, _lower_scale = lower_matrix.decompose()
         if previous_lower_quat is not None and previous_lower_quat.dot(lower_quat) < 0.0:
             lower_quat.negate()
         previous_lower_quat = lower_quat.copy()
@@ -522,36 +610,54 @@ def _capture_channels(context, source, target, frames, bone_map, target_source_m
             lower_channels["loc"][component].append(float(lower_loc[component]))
         for component in range(4):
             lower_channels["quat"][component].append(float(lower_quat[component]))
-        lower_rebuilt = Matrix.LocRotScale(lower_loc, lower_quat, Vector((1.0, 1.0, 1.0)))
-        max_lower_matrix_error = max(max_lower_matrix_error, _matrix_error(lower_matrix, lower_rebuilt))
+        lower_rebuilt = Matrix.LocRotScale(
+            lower_loc, lower_quat, Vector((1.0, 1.0, 1.0))
+        )
+        max_lower_matrix_error = max(
+            max_lower_matrix_error, _matrix_error(lower_matrix, lower_rebuilt)
+        )
 
-        for bone_name in _mapped_output_bones(bone_map):
-            actual_name = bone_map[bone_name]
-            target_bone = target.data.bones[actual_name]
-            desired = desired_pose[actual_name]
-            if target_bone.parent:
-                parent_name = target_bone.parent.name
-                if parent_name not in desired_pose:
+        for bone_name in mapped_output_bones:
+            bridge_bone, target_bone = output_pairs[bone_name]
+            if bone_name in passthrough_bones:
+                loc, quat, _scale = input_bases[bone_name].decompose()
+                if bone_name in previous_quat and previous_quat[bone_name].dot(quat) < 0.0:
+                    quat.negate()
+                previous_quat[bone_name] = quat.copy()
+                for component in range(3):
+                    channels[bone_name]["loc"][component].append(float(loc[component]))
+                for component in range(4):
+                    channels[bone_name]["quat"][component].append(float(quat[component]))
+                continue
+            if bone_name not in desired_pose:
+                raise ConversionError(f"內建模板無法計算輸出骨骼：{bone_name}")
+            if bridge_bone.parent:
+                if bridge_bone.parent.name not in desired_pose:
                     raise ConversionError(
-                        f"無法反解 {bone_name}（{actual_name}）：缺少父骨 {parent_name} 的姿勢。"
+                        f"內建模板缺少 {bone_name} 的父骨姿勢：{bridge_bone.parent.name}"
                     )
-                basis = target_bone.convert_local_to_pose(
-                    desired,
-                    target_bone.matrix_local,
-                    parent_matrix=desired_pose[parent_name],
-                    parent_matrix_local=target_bone.parent.matrix_local,
+                bridge_basis = bridge_bone.convert_local_to_pose(
+                    desired_pose[bone_name],
+                    bridge_bone.matrix_local,
+                    parent_matrix=desired_pose[bridge_bone.parent.name],
+                    parent_matrix_local=bridge_bone.parent.matrix_local,
                     invert=True,
                 )
             else:
-                basis = target_bone.convert_local_to_pose(
-                    desired, target_bone.matrix_local, invert=True
+                bridge_basis = bridge_bone.convert_local_to_pose(
+                    desired_pose[bone_name], bridge_bone.matrix_local, invert=True
                 )
-
-            loc, quat, scale = basis.decompose()
-            scale_error = max(abs(float(component) - 1.0) for component in scale)
+            scale_error = max(
+                abs(float(component) - 1.0)
+                for component in bridge_basis.to_scale()
+            )
             if scale_error > max_basis_scale_error:
                 max_basis_scale_error = scale_error
-                worst_scale = (frame, f"{bone_name}({actual_name})")
+                worst_scale = (frame, f"{bone_name}({bone_map[bone_name]})")
+            target_basis = _basis_between_rigs(
+                bridge_basis, bridge_bone, target_bone
+            )
+            loc, quat, _scale = target_basis.decompose()
             if bone_name in previous_quat and previous_quat[bone_name].dot(quat) < 0.0:
                 quat.negate()
             previous_quat[bone_name] = quat.copy()
@@ -559,7 +665,6 @@ def _capture_channels(context, source, target, frames, bone_map, target_source_m
                 channels[bone_name]["loc"][component].append(float(loc[component]))
             for component in range(4):
                 channels[bone_name]["quat"][component].append(float(quat[component]))
-
         window_manager.progress_update(index + 1)
 
     if max_basis_scale_error > SCALE_GATE:
@@ -570,7 +675,7 @@ def _capture_channels(context, source, target, frames, bone_map, target_source_m
     return channels, lower_channels, max_basis_scale_error, max_lower_matrix_error
 
 
-def _validate_result(context, source, target, output_action, frames, bone_map):
+def _validate_result(context, target, output_action, frames, bone_map, channels):
     target.animation_data_create()
     target.animation_data.action = output_action
     _disable_leg_ik(target, bone_map)
@@ -586,15 +691,20 @@ def _validate_result(context, source, target, output_action, frames, bone_map):
         context.view_layer.update()
         _assert_leg_ik_off(target, bone_map, frame)
         for bone_name in _mapped_output_bones(bone_map):
-            source_bone = source.data.bones[bone_name]
             actual_name = bone_map[bone_name]
-            target_bone = target.data.bones[actual_name]
-            expected = (
-                target_bone.matrix_local
-                @ source_bone.matrix_local.inverted()
-                @ source.pose.bones[bone_name].matrix
+            frame_index = index
+            expected_location = Vector(tuple(
+                channels[bone_name]["loc"][component][frame_index]
+                for component in range(3)
+            ))
+            expected_quaternion = Quaternion(tuple(
+                channels[bone_name]["quat"][component][frame_index]
+                for component in range(4)
+            ))
+            expected = Matrix.LocRotScale(
+                expected_location, expected_quaternion, Vector((1.0, 1.0, 1.0))
             )
-            actual = target.pose.bones[actual_name].matrix
+            actual = target.pose.bones[actual_name].matrix_basis
             matrix_error = _matrix_error(expected, actual)
             translation_error = _matrix_translation_error(expected, actual)
             if matrix_error > max_matrix_error:
@@ -607,7 +717,7 @@ def _validate_result(context, source, target, output_action, frames, bone_map):
 
     if max_matrix_error > MATRIX_GATE:
         raise ConversionError(
-            f"輸出驗證失敗：矩陣差 {max_matrix_error:.9g} > {MATRIX_GATE:g} "
+            f"輸出驗證失敗：Basis 重播差 {max_matrix_error:.9g} > {MATRIX_GATE:g} "
             f"（frame {worst_matrix[0]}，bone {worst_matrix[1]}）。"
         )
     return max_matrix_error, max_translation_error, worst_matrix, worst_translation
@@ -644,7 +754,7 @@ def convert_action(context, target, input_action, output_name):
     input_digest_before = _action_digest(input_action)
     input_action.use_fake_user = True
     source = None
-    source_action = None
+    bridge = None
     output_action = None
     lower_action = None
     bone_map = None
@@ -654,9 +764,10 @@ def convert_action(context, target, input_action, output_name):
     context.window_manager.progress_begin(0, len(frames) * 2)
 
     try:
-        source = _append_source_template(scene)
+        source, bridge = _append_templates(scene)
         source.hide_set(False)
         source.matrix_world = target.matrix_world.copy()
+        bridge.matrix_world = target.matrix_world.copy()
         bone_map, mapping_sources = _resolve_bone_map(target)
         original_leg_ik_influences = [
             (constraint, float(constraint.influence))
@@ -672,25 +783,25 @@ def convert_action(context, target, input_action, output_name):
         if missing_source:
             raise ConversionError("來源模板缺少輸出骨骼：" + ", ".join(missing_source))
 
-        source_action = input_action.copy()
-        source_action.name = f"__PJSK_SOURCE_{input_action.name}__"
-        remapped_curves, unresolved_action_bones = _remap_source_action(
-            source_action, source, target, bone_map
-        )
-        source.animation_data_create()
-        source.animation_data.action = source_action
-
         target_source_map = _resolve_target_source_map(source, target, bone_map)
+        passthrough_bones = _passthrough_bones(
+            bridge, target, bone_map, target_source_map
+        )
         channels, lower_channels, max_scale_error, max_lower_error = _capture_channels(
-            context, source, target, frames, bone_map, target_source_map
+            context, source, bridge, target, input_action, frames, bone_map,
+            target_source_map, passthrough_bones,
         )
         lower_action = _make_lower_action(
             lower_name, frames, lower_channels, bone_map["LowerBody"]
         )
-        output_action = _make_action(output_name, frames, channels, bone_map)
+        output_action = _make_action(
+            output_name, frames, channels, bone_map,
+            input_action=input_action,
+            target_source_map=target_source_map,
+        )
 
         max_matrix_error, max_translation_error, worst_matrix, worst_translation = _validate_result(
-            context, source, target, output_action, frames, bone_map
+            context, target, output_action, frames, bone_map, channels
         )
         input_digest_after = _action_digest(input_action)
         if input_digest_after != input_digest_before:
@@ -715,9 +826,13 @@ def convert_action(context, target, input_action, output_name):
             "output_keys": sum(len(fc.keyframe_points) for fc in output_action.fcurves),
             "source_digest_before": input_digest_before,
             "source_digest_after": input_digest_after,
-            "target_rest_pose": "使用目標模型實際 Rest Matrix",
+            "retarget_method": "已驗證 TDA 模板橋接 + 目標 Rest 軸換算",
+            "target_rest_pose": "使用目標模型實際 Rest Matrix 與骨軸",
             "bone_mapping_count": len(bone_map),
             "hierarchy_bones_mapped": len(target_source_map),
+            "hierarchy_passthrough_bones": ",".join(
+                sorted(passthrough_bones)
+            ) or "NONE",
             "bone_mapping_sources": ",".join(
                 f"{key}:{value}" for key, value in mapping_source_counts.items()
             ),
@@ -725,11 +840,9 @@ def convert_action(context, target, input_action, output_name):
                 f"{canonical}->{bone_map[canonical]}"
                 for canonical in _mapped_output_bones(bone_map)
             ),
-            "source_action_curves_remapped": remapped_curves,
-            "source_action_unresolved_bones": ",".join(unresolved_action_bones) or "NONE",
             "max_lowerbody_matrix_error": max_lower_error,
-            "max_output_matrix_error": max_matrix_error,
-            "max_output_translation_error": max_translation_error,
+            "max_output_basis_replay_error": max_matrix_error,
+            "max_output_location_replay_error": max_translation_error,
             "worst_matrix_frame_bone": f"{worst_matrix[0]},{worst_matrix[1]}",
             "worst_translation_frame_bone": f"{worst_translation[0]},{worst_translation[1]}",
             "max_scale_deviation": max_scale_error,
@@ -760,8 +873,10 @@ def convert_action(context, target, input_action, output_name):
             if source.animation_data:
                 source.animation_data.action = None
             _remove_object(source)
-        if source_action and source_action.name in bpy.data.actions:
-            bpy.data.actions.remove(source_action)
+        if bridge:
+            if bridge.animation_data:
+                bridge.animation_data.action = None
+            _remove_object(bridge)
 
 
 class PJSK_TDA_OT_convert(bpy.types.Operator):
@@ -822,7 +937,7 @@ class PJSK_TDA_OT_convert(bpy.types.Operator):
 
         self.report(
             {"INFO"},
-            f"PASS：{output_action.name}；LowerBody={lower_action.name}；最大矩陣差={max_error:.3g}",
+            f"PASS：{output_action.name}；LowerBody={lower_action.name}；最大 Basis 重播差={max_error:.3g}",
         )
         return {"FINISHED"}
 

@@ -1,5 +1,17 @@
 # PJSK → TDA Auto Converter 驗證
 
+## 1.2.1 不同體型與自製骨架相容性
+
+- Blender：4.2.22 LTS；五個模型皆以實際插件程式完整轉換 1–4036。
+- `PPPP TETO`：PASS，最大 Basis 重播誤差 `4.76837158203125e-07`；來源 Action digest 前後一致，Scale／IK curves 為 0。
+- `PPPP MIKU`：PASS，最大 Basis 重播誤差 `4.76837158203125e-07`；來源 Action digest 前後一致，Scale／IK curves 為 0。
+- `Tda式初音ミク Mトレース用モデル`：PASS，62 個輸出骨全部走標準橋接，最大 Basis 重播誤差 `4.76837158203125e-07`。
+- `Midlander.pmx`：PASS；缺少選配 `Eyes`，自製階層不相容的 `Leg/LegTipEX/Neck` 保守保留輸入通道。
+- `KAITOwCOAT+phy-RexZ-A.pmx`：PASS；缺少選配 `Eyes`，肩臂等自製中介骨鏈保守保留輸入通道。
+- Midlander、KAITO 與 PPPP Teto 的實際 Mesh 於 3480–3580 以固定 FRONT／RIGHT、Z=0 地面基準檢查：未出現 v1.2.0 的爆體、手臂下墜、腿部拉伸或新增明顯抖動。
+- 骨名配對改為「實際骨名優先、MMD metadata 次之」，避免 KAITO 的錯誤 metadata 蓋過正確骨名。
+- v1.2.0 的失敗根因：直接要求不同體型／骨軸／父鏈的模型重現同一份完整世界姿勢，會製造過大的局部位移；同一套輸出矩陣驗證也把安全輸出誤判為失敗。1.2.1 改為已驗證 TDA 橋接、目標 Rest 骨軸換算、階層差異保守保留輸入通道，並驗證實際輸出的 Basis 可逐幀重播。
+
 ## 1.2.0 常見 TDA 相容性
 
 - Blender：4.2.22 LTS。

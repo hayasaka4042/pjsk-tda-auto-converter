@@ -1,6 +1,6 @@
 # PJSK to TDA Auto Converter
 
-This is a Blender add-on I made for my own use to fix several issues in motions extracted from PJSK. It converts an existing Action for a common TDA armature by comparing the source and target rest poses. Support for common Japanese and English bone names was added later so the add-on is not tied to one specific model.
+This is a Blender add-on I made for my own use to fix several issues in motions extracted from PJSK. It converts an existing Action through a verified TDA bridge while adapting the result to the target model's own rest axes. Support for common Japanese and English bone names was added later so the add-on is not tied to one specific model.
 
 Tested with Blender 4.2.22 LTS.
 
@@ -19,23 +19,24 @@ If no Action is selected in the panel, the add-on uses the Action currently assi
 
 ## What it does
 
-- Recognizes common Japanese and English TDA bone names, including MMD Tools `name_j` and `name_e` metadata.
-- Uses the actual rest matrices of the target model instead of requiring one exact TDA skeleton.
+- Recognizes common Japanese and English TDA bone names. Actual bone names take priority over MMD Tools `name_j` and `name_e` metadata.
+- Converts through a verified TDA bridge and adapts the curves to the actual rest matrices and bone axes of the target model.
 - Handles common TDA helper chains such as Shoulder P/C, Waist Cancel, and Leg D bones.
-- Converts `Dummy_L/R` when present and skips them when the model does not have them.
+- Preserves the input channels for bones whose custom parent hierarchy cannot safely use the standard bridge result.
+- Converts `Eyes` and `Dummy_L/R` when present and skips them when the model does not have them.
 - Turns off the leg and toe IK constraints used by the target rig and checks that they stay off during the converted Action.
-- Writes quaternion location/rotation curves without scale curves and leaves the source Action unchanged.
+- Keeps model-specific non-output curves, writes quaternion location/rotation curves, removes scale and leg/toe IK curves, and leaves the source Action unchanged.
 - Creates a validation report in Blender's Text Editor.
 
 The conversion creates:
 
 - `<output name>` — the converted Action.
 - `<output name>_LowerBody_WORLD_BAKE` — a LowerBody world/armature-space reference Action.
-- `<output name>_validation.txt` — bone mapping, frame range, IK state, and matrix error information.
+- `<output name>_validation.txt` — bone mapping, conservative hierarchy pass-through, frame range, IK state, and output replay error information.
 
 ## Limitations
 
-This is an Action converter, not a PMX/VMD importer and not a foot-contact or foot-sliding fixer. It is intended for common TDA-style rigs, not every custom MMD armature. Missing core bones, ambiguous bone names, or constraints that prevent the target pose from matching will stop the conversion instead of being guessed around.
+This is an Action converter, not a PMX/VMD importer and not a foot-contact or foot-sliding fixer. It is intended for common TDA-style rigs, not every custom MMD armature. For a custom helper hierarchy, affected bones are conservatively passed through instead of being forced through an incompatible parent chain. Missing core bones or ambiguous bone names still stop the conversion instead of being guessed around.
 
 ## Credits / test asset
 
@@ -57,7 +58,7 @@ Detailed test results are kept in [PJSK_TDA_AutoConverter_validation.md](PJSK_TD
 
 # PJSK → TDA 自動轉換器
 
-這只是一個基於個人需求，為了修復從 PJSK 提取的動作中某些問題而製作的 Blender 插件。它會比較來源與目標骨架的 Rest Pose，把現有 Action 轉到常見的 TDA 骨架上。後來補上常見日文、英文骨名的辨識，因此不再只綁定單一模型。
+這只是一個基於個人需求，為了修復從 PJSK 提取的動作中某些問題而製作的 Blender 插件。它會先經過已驗證的 TDA 橋接骨架轉換，再依照目標模型自己的 Rest 骨軸調整現有 Action。後來補上常見日文、英文骨名的辨識，因此不再只綁定單一模型。
 
 目前以 Blender 4.2.22 LTS 測試。
 
@@ -76,23 +77,24 @@ Detailed test results are kept in [PJSK_TDA_AutoConverter_validation.md](PJSK_TD
 
 ## 會處理的內容
 
-- 辨識常見 TDA 日文、英文骨名，以及 MMD Tools 的 `name_j`／`name_e` 資料。
-- 使用目標模型本身的 Rest Matrix，不要求骨架尺寸與單一模板完全相同。
+- 辨識常見 TDA 日文、英文骨名；實際骨名優先於 MMD Tools 的 `name_j`／`name_e` 資料。
+- 經過已驗證的 TDA 橋接骨架轉換，再套用目標模型本身的 Rest Matrix 與骨軸。
 - 處理常見的肩 P／C、腰取消與 Leg D 中介骨鏈。
-- 模型有 `Dummy_L/R` 就轉換，沒有則略過。
+- 自製父子階層無法安全套用標準橋接結果時，只讓受影響的骨保留原輸入通道。
+- 模型有 `Eyes`、`Dummy_L/R` 就轉換，沒有則略過。
 - 關閉目標骨架的腿部與腳尖 IK，並確認轉換後的 Action 播放期間沒有重新啟用。
-- 輸出 Quaternion 的位置與旋轉曲線，不建立 Scale 曲線，也不修改來源 Action。
+- 保留模型專用的非輸出曲線，輸出 Quaternion 的位置與旋轉曲線，移除 Scale 與腿部／腳尖 IK 曲線，也不修改來源 Action。
 - 在 Blender Text Editor 留下一份轉換驗證紀錄。
 
 每次轉換會建立：
 
 - `<輸出名稱>`：轉換後的 Action。
 - `<輸出名稱>_LowerBody_WORLD_BAKE`：LowerBody 的世界／骨架空間參考 Action。
-- `<輸出名稱>_validation.txt`：骨名配對、幀範圍、IK 狀態與矩陣誤差。
+- `<輸出名稱>_validation.txt`：骨名配對、保守略過的自製階層骨、幀範圍、IK 狀態與輸出重播誤差。
 
 ## 限制
 
-這是 Action 轉換器，不負責匯入 PMX／VMD，也不會修正腳底接觸或滑步。它是給常見 TDA 類型骨架使用，不保證每一支自製 MMD 骨架都能直接轉換。核心骨缺失、骨名無法唯一判斷，或既有 Constraint 讓目標姿勢無法重現時，插件會停止，不會自行猜骨頭。
+這是 Action 轉換器，不負責匯入 PMX／VMD，也不會修正腳底接觸或滑步。它是給常見 TDA 類型骨架使用，不保證每一支自製 MMD 骨架都能完整套用標準轉換。遇到自製中介骨階層時，插件會保守保留受影響骨骼的原輸入通道，不會硬套錯誤父鏈；核心骨缺失或骨名無法唯一判斷時仍會停止，不會自行猜骨頭。
 
 ## 借物表／測試素材
 
