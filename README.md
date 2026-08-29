@@ -6,7 +6,7 @@ Tested with Blender 4.2.22 LTS.
 
 ## Download
 
-[Download the latest `PJSK_TDA_AutoConverter.zip`](https://github.com/hayasaka4042-cpu/pjsk-tda-auto-converter/releases/latest/download/PJSK_TDA_AutoConverter.zip)
+[Download the latest `PJSK_TDA_AutoConverter.zip`](https://github.com/hayasaka4042/pjsk-tda-auto-converter/releases/latest/download/PJSK_TDA_AutoConverter.zip)
 
 ## Installation and use
 
@@ -63,7 +63,7 @@ Detailed test results are kept in [PJSK_TDA_AutoConverter_validation.md](PJSK_TD
 
 ## 下載
 
-[下載最新版 `PJSK_TDA_AutoConverter.zip`](https://github.com/hayasaka4042-cpu/pjsk-tda-auto-converter/releases/latest/download/PJSK_TDA_AutoConverter.zip)
+[下載最新版 `PJSK_TDA_AutoConverter.zip`](https://github.com/hayasaka4042/pjsk-tda-auto-converter/releases/latest/download/PJSK_TDA_AutoConverter.zip)
 
 ## 安裝與使用
 
