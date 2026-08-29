@@ -1,5 +1,24 @@
 # PJSK → TDA Auto Converter 驗證
 
+## 1.2.0 常見 TDA 相容性
+
+- Blender：4.2.22 LTS。
+- 英文標準骨名短範圍：PASS，434 F-Curves，最大矩陣誤差 `3.78489494e-06`。
+- 全套日文骨名短範圍：PASS，62／62 語意骨配對，8 條日文 Action F-Curve 路徑自動重映射，最大誤差 `3.78489494e-06`。
+- 任意 Blender 骨名、僅保留 MMD 日文名稱欄位：PASS，62／62 配對，最大誤差 `3.78489494e-06`。
+- 不同 Rest Matrix 葉骨測試：PASS，最大誤差 `3.78489494e-06`。
+- 缺少 `Dummy_L/R`：PASS，安全略過兩個非核心葉端骨，輸出 60 bones／420 F-Curves。
+- 缺少核心 `Head`：正確 FAIL。
+- 兩個骨同時宣告為 `Head`：正確以「骨名有歧義」FAIL，未猜測。
+- 強制製造輸出矩陣失敗：正確恢復原 Action、6 個腿部 IK influence 與原 Rotation Mode，沒有留下半成品 Action。
+- 原始 PMX 骨名辨識：
+  - `Tda式初音ミク Mトレース用モデル`：62／62，6 個腿部 IK Constraint 找到。
+  - `PPPP MIKU by ShyuuXi`：60／60，僅缺選配 `Dummy_L/R`，6 個腿部 IK Constraint 找到。
+  - `PPPP TETO by ShyuuXi`：60／60，僅缺選配 `Dummy_L/R`，6 個腿部 IK Constraint 找到。
+- Miku 完整 1–4036 回歸：PASS，434 F-Curves、1,751,624 keys，最大輸出矩陣誤差 `8.59797001e-06`；來源 Action digest 前後一致。
+
+原始 PMX 抽查只驗證插件的骨名辨識；本機現有舊版 MMD Tools 在 Blender 4.2 匯入末段仍會碰到已移除的 `EditBone.layers` API。插件的完整動作驗證使用既有可正常工作的 TDA Blender 骨架與同一套全曲 Action。
+
 ## 1.1.0 新手流程與 IK 防呆
 
 - Blender：4.2.22 LTS。

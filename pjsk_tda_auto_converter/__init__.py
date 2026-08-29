@@ -1,19 +1,21 @@
 bl_info = {
     "name": "PJSK to TDA Auto Converter",
     "author": "Codex",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > PJSK→TDA",
-    "description": "將 PJSK/MMD Action 依靜置姿勢相對矩陣轉換到已驗證的 TDA 初音骨架",
+    "description": "依實際骨名與 Rest Matrix，將 PJSK/MMD Action 轉換到常見 TDA 骨架",
     "category": "Animation",
 }
 
 import hashlib
 import math
 import os
+import re
 import struct
 import time
 import traceback
+import unicodedata
 
 import bpy
 from bpy.props import PointerProperty, StringProperty
@@ -21,10 +23,8 @@ from mathutils import Matrix, Vector
 
 
 SOURCE_TEMPLATE_NAME = "PJSK_Source_Rig_TEMPLATE"
-TARGET_TEMPLATE_NAME = "TDA_Target_Rig_TEMPLATE"
 TEMPLATE_FILE = "pjsk_tda_rig_template.blend"
 MATRIX_GATE = 1.0e-4
-REST_GATE = 1.0e-5
 SCALE_GATE = 1.0e-5
 LEG_IK_BONES = ("Knee_L", "Knee_R", "Ankle_L", "Ankle_R")
 
@@ -45,6 +45,93 @@ OUTPUT_BONES = (
     "MiddleFinger3_L", "MiddleFinger3_R", "RingFinger3_L", "RingFinger3_R",
     "Thumb2_L", "Thumb2_R",
 )
+OPTIONAL_BONES = frozenset(("Dummy_L", "Dummy_R"))
+
+
+_BASE_BONE_ALIASES = {
+    "ParentNode": ("全ての親", "AllParent", "MotherBone"),
+    "Center": ("センター", "ｾﾝﾀｰ"),
+    "Groove": ("グルーブ",),
+    "Waist": ("腰",),
+    "LowerBody": ("下半身",),
+    "UpperBody": ("上半身",),
+    "UpperBody2": ("上半身2", "上半身２"),
+    "Neck": ("首",),
+    "Head": ("頭",),
+    "Eyes": ("両目",),
+    "Leg_L": ("左足", "LeftLeg", "LegLeft"),
+    "Leg_R": ("右足", "RightLeg", "LegRight"),
+    "Knee_L": ("左ひざ", "左膝", "LeftKnee", "KneeLeft"),
+    "Knee_R": ("右ひざ", "右膝", "RightKnee", "KneeRight"),
+    "Shoulder_L": ("左肩", "LeftShoulder", "ShoulderLeft"),
+    "Shoulder_R": ("右肩", "RightShoulder", "ShoulderRight"),
+    "Ankle_L": ("左足首", "LeftAnkle", "AnkleLeft"),
+    "Ankle_R": ("右足首", "RightAnkle", "AnkleRight"),
+    "Arm_L": ("左腕", "LeftArm", "ArmLeft"),
+    "Arm_R": ("右腕", "RightArm", "ArmRight"),
+    "LegTipEX_L": ("左足先EX", "左つま先EX", "LeftLegTipEX", "LegTipEXLeft"),
+    "LegTipEX_R": ("右足先EX", "右つま先EX", "RightLegTipEX", "LegTipEXRight"),
+    "ArmTwist_L": ("左腕捩", "左腕捻", "LeftArmTwist", "ArmTwistLeft"),
+    "ArmTwist_R": ("右腕捩", "右腕捻", "RightArmTwist", "ArmTwistRight"),
+    "Elbow_L": ("左ひじ", "左肘", "LeftElbow", "ElbowLeft"),
+    "Elbow_R": ("右ひじ", "右肘", "RightElbow", "ElbowRight"),
+    "HandTwist_L": ("左手捩", "左手捻", "LeftHandTwist", "HandTwistLeft"),
+    "HandTwist_R": ("右手捩", "右手捻", "RightHandTwist", "HandTwistRight"),
+    "Wrist_L": ("左手首", "LeftWrist", "WristLeft"),
+    "Wrist_R": ("右手首", "RightWrist", "WristRight"),
+    "Dummy_L": ("左ダミー", "LeftDummy", "DummyLeft"),
+    "Dummy_R": ("右ダミー", "RightDummy", "DummyRight"),
+}
+
+
+def _build_bone_aliases():
+    aliases = {name: set(values) | {name} for name, values in _BASE_BONE_ALIASES.items()}
+    finger_japanese = {
+        "IndexFinger": ("人指", "人差指"),
+        "LittleFinger": ("小指",),
+        "MiddleFinger": ("中指",),
+        "RingFinger": ("薬指",),
+        "Thumb": ("親指",),
+    }
+    for canonical in OUTPUT_BONES:
+        aliases.setdefault(canonical, {canonical})
+        match = re.fullmatch(r"(IndexFinger|LittleFinger|MiddleFinger|RingFinger|Thumb)([0-3])_([LR])", canonical)
+        if not match:
+            continue
+        finger, digit, side = match.groups()
+        side_j = "左" if side == "L" else "右"
+        side_e = "Left" if side == "L" else "Right"
+        for finger_j in finger_japanese[finger]:
+            aliases[canonical].add(f"{side_j}{finger_j}{digit}")
+        aliases[canonical].add(f"{side_e}{finger}{digit}")
+        aliases[canonical].add(f"{finger}{digit}{side_e}")
+    return {name: tuple(sorted(values)) for name, values in aliases.items()}
+
+
+BONE_ALIASES = _build_bone_aliases()
+
+SOURCE_BONE_ALIASES = {
+    "ControlNode": ("操作中心", "ControlNode"),
+    "UpperBody1": ("上半身1", "上半身１", "UpperBody1"),
+    "ShoulderP_L": ("左肩P", "ShoulderP_L"),
+    "ShoulderP_R": ("右肩P", "ShoulderP_R"),
+    "ShoulderC_L": ("左肩C", "ShoulderC_L"),
+    "ShoulderC_R": ("右肩C", "ShoulderC_R"),
+    "WaistCancel_L": ("腰キャンセル左", "WaistCancel_L"),
+    "WaistCancel_R": ("腰キャンセル右", "WaistCancel_R"),
+    "LegD_L": ("左足D", "LegD_L"),
+    "LegD_R": ("右足D", "LegD_R"),
+    "KneeD_L": ("左ひざD", "左膝D", "KneeD_L"),
+    "KneeD_R": ("右ひざD", "右膝D", "KneeD_R"),
+    "AnkleD_L": ("左足首D", "AnkleD_L"),
+    "AnkleD_R": ("右足首D", "AnkleD_R"),
+    "LegIKParent_L": ("左足IK親", "左足ＩＫ親", "LegIKParent_L"),
+    "LegIKParent_R": ("右足IK親", "右足ＩＫ親", "LegIKParent_R"),
+    "LegIK_L": ("左足IK", "左足ＩＫ", "LegIK_L"),
+    "LegIK_R": ("右足IK", "右足ＩＫ", "LegIK_R"),
+    "ToeTipIK_L": ("左つま先IK", "左つま先ＩＫ", "ToeTipIK_L"),
+    "ToeTipIK_R": ("右つま先IK", "右つま先ＩＫ", "ToeTipIK_R"),
+}
 
 
 class ConversionError(RuntimeError):
@@ -72,51 +159,125 @@ def _action_digest(action):
     return digest.hexdigest()
 
 
-def _constraint_signature(obj):
-    result = []
-    for pose_bone in obj.pose.bones:
-        for constraint in pose_bone.constraints:
-            target = getattr(constraint, "target", None)
-            if target is obj:
-                target_semantics = "SELF"
-            elif target is None:
-                target_semantics = None
-            else:
-                target_semantics = target.name
-            result.append((
-                pose_bone.name,
-                constraint.name,
-                constraint.type,
-                target_semantics,
-                getattr(constraint, "subtarget", ""),
-                int(getattr(constraint, "chain_count", 0)),
-            ))
-    return tuple(sorted(result))
+def _normalize_bone_name(value):
+    value = unicodedata.normalize("NFKC", value or "").casefold()
+    return "".join(character for character in value if character.isalnum())
 
 
-def _leg_ik_constraints(obj):
+def _mmd_names(pose_bone):
+    mmd_bone = getattr(pose_bone, "mmd_bone", None)
+    name_j = getattr(mmd_bone, "name_j", "") if mmd_bone else ""
+    name_e = getattr(mmd_bone, "name_e", "") if mmd_bone else ""
+    if not name_j:
+        name_j = pose_bone.get("mmd_bone_name_j", pose_bone.get("name_j", ""))
+    if not name_e:
+        name_e = pose_bone.get("mmd_bone_name_e", pose_bone.get("name_e", ""))
+    return str(name_j or ""), str(name_e or "")
+
+
+def _resolve_bone_map(target):
+    if target.type != "ARMATURE":
+        raise ConversionError("目前選取物件不是骨架。")
+
+    alias_sets = {
+        canonical: {_normalize_bone_name(alias) for alias in aliases}
+        for canonical, aliases in BONE_ALIASES.items()
+    }
+    alias_text_sets = {
+        canonical: {unicodedata.normalize("NFKC", alias).casefold() for alias in aliases}
+        for canonical, aliases in BONE_ALIASES.items()
+    }
+    mapping = {}
+    mapping_sources = {}
+    missing = []
+    ambiguous = []
+
+    for canonical in OUTPUT_BONES:
+        candidates = []
+        for pose_bone in target.pose.bones:
+            name_j, name_e = _mmd_names(pose_bone)
+            labels = (
+                ("骨名", pose_bone.name),
+                ("MMD日文名", name_j),
+                ("MMD英文名", name_e),
+            )
+            best_score = None
+            best_source = None
+            for source, label in labels:
+                normalized = _normalize_bone_name(label)
+                if not normalized or normalized not in alias_sets[canonical]:
+                    continue
+                if source == "骨名" and label == canonical:
+                    score = 0
+                elif unicodedata.normalize("NFKC", label).casefold() in alias_text_sets[canonical]:
+                    score = 1
+                else:
+                    score = 3
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_source = source
+            if best_score is not None:
+                candidates.append((best_score, pose_bone.name, best_source))
+
+        if not candidates:
+            if canonical not in OPTIONAL_BONES:
+                missing.append(canonical)
+            continue
+        best_score = min(item[0] for item in candidates)
+        best = [item for item in candidates if item[0] == best_score]
+        if len(best) != 1:
+            ambiguous.append(f"{canonical}→{','.join(item[1] for item in best[:4])}")
+            continue
+        _score, actual_name, source = best[0]
+        mapping[canonical] = actual_name
+        mapping_sources[canonical] = source
+
+    if missing:
+        raise ConversionError("TDA 骨架缺少必要語意骨：" + ", ".join(missing))
+    if ambiguous:
+        raise ConversionError("TDA 骨名有歧義，禁止猜測：" + "; ".join(ambiguous))
+
+    duplicate_actual = {}
+    for canonical, actual_name in mapping.items():
+        duplicate_actual.setdefault(actual_name, []).append(canonical)
+    duplicate_actual = {
+        actual_name: canonicals
+        for actual_name, canonicals in duplicate_actual.items()
+        if len(canonicals) > 1
+    }
+    if duplicate_actual:
+        details = "; ".join(
+            f"{actual_name}→{','.join(canonicals)}"
+            for actual_name, canonicals in duplicate_actual.items()
+        )
+        raise ConversionError("同一骨骼被配對到多個語意，禁止轉換：" + details)
+    return mapping, mapping_sources
+
+
+def _mapped_output_bones(bone_map):
+    return tuple(name for name in OUTPUT_BONES if name in bone_map)
+
+
+def _leg_ik_constraints(obj, bone_map):
     result = []
-    for bone_name in LEG_IK_BONES:
+    for canonical in LEG_IK_BONES:
+        bone_name = bone_map[canonical]
         pose_bone = obj.pose.bones.get(bone_name)
         if pose_bone is None:
-            raise ConversionError(f"目標缺少腿部骨骼：{bone_name}")
+            raise ConversionError(f"目標缺少腿部骨骼：{canonical}（{bone_name}）")
         for constraint in pose_bone.constraints:
             if constraint.type == "IK" or constraint.name == "mmd_ik_limit_override":
-                result.append((bone_name, constraint))
-    if len(result) != 6:
-        raise ConversionError(
-            f"腿部 IK 結構不符：預期 6 個相關 Constraint，實際找到 {len(result)} 個。"
-        )
+                result.append((canonical, bone_name, constraint))
     return result
 
 
-def _disable_leg_ik(obj):
-    constraints = _leg_ik_constraints(obj)
-    for _bone_name, constraint in constraints:
+def _disable_leg_ik(obj, bone_map):
+    constraints = _leg_ik_constraints(obj, bone_map)
+    for _canonical, _bone_name, constraint in constraints:
         constraint.influence = 0.0
     active = [
-        f"{bone_name}/{constraint.name}={constraint.influence:g}"
-        for bone_name, constraint in constraints
+        f"{canonical}({bone_name})/{constraint.name}={constraint.influence:g}"
+        for canonical, bone_name, constraint in constraints
         if abs(float(constraint.influence)) > 1.0e-8
     ]
     if active:
@@ -124,10 +285,10 @@ def _disable_leg_ik(obj):
     return len(constraints)
 
 
-def _assert_leg_ik_off(obj, frame):
+def _assert_leg_ik_off(obj, bone_map, frame):
     active = [
-        f"{bone_name}/{constraint.name}={constraint.influence:g}"
-        for bone_name, constraint in _leg_ik_constraints(obj)
+        f"{canonical}({bone_name})/{constraint.name}={constraint.influence:g}"
+        for canonical, bone_name, constraint in _leg_ik_constraints(obj, bone_map)
         if abs(float(constraint.influence)) > 1.0e-8
     ]
     if active:
@@ -136,64 +297,29 @@ def _assert_leg_ik_off(obj, frame):
         )
 
 
-def _validate_target(target, template_target):
-    if target.type != "ARMATURE":
-        raise ConversionError("目前選取物件不是骨架。")
-
-    missing = [bone.name for bone in template_target.data.bones if bone.name not in target.data.bones]
-    if missing:
-        raise ConversionError("目標不是已驗證的 TDA 骨架；缺少骨骼：" + ", ".join(missing[:8]))
-
-    max_rest_error = 0.0
-    wrong_parent = []
-    for template_bone in template_target.data.bones:
-        target_bone = target.data.bones[template_bone.name]
-        template_parent = template_bone.parent.name if template_bone.parent else None
-        target_parent = target_bone.parent.name if target_bone.parent else None
-        if target_parent != template_parent:
-            wrong_parent.append(template_bone.name)
-        max_rest_error = max(
-            max_rest_error,
-            _matrix_error(target_bone.matrix_local, template_bone.matrix_local),
-        )
-
-    if wrong_parent:
-        raise ConversionError("TDA 骨架父子關係不符：" + ", ".join(wrong_parent[:8]))
-    if max_rest_error > REST_GATE:
-        raise ConversionError(
-            f"TDA rest matrix 不符（最大差 {max_rest_error:.9g} > {REST_GATE:g}）。"
-        )
-    if _constraint_signature(target) != _constraint_signature(template_target):
-        raise ConversionError("TDA 既有 constraint 結構已變更；為避免錯誤烘焙已停止。")
-
-    missing_output = [name for name in OUTPUT_BONES if name not in target.pose.bones]
-    if missing_output:
-        raise ConversionError("目標缺少輸出骨骼：" + ", ".join(missing_output))
-    non_quaternion = [
-        name for name in OUTPUT_BONES
-        if target.pose.bones[name].rotation_mode != "QUATERNION"
-    ]
-    if non_quaternion:
-        raise ConversionError("以下骨骼不是 Quaternion 模式：" + ", ".join(non_quaternion[:8]))
-    return max_rest_error
+def _set_quaternion_modes(target, bone_map):
+    changed = []
+    for canonical in _mapped_output_bones(bone_map):
+        pose_bone = target.pose.bones[bone_map[canonical]]
+        if pose_bone.rotation_mode != "QUATERNION":
+            changed.append((pose_bone, pose_bone.rotation_mode))
+            pose_bone.rotation_mode = "QUATERNION"
+    return changed
 
 
-def _append_templates(scene):
+def _append_source_template(scene):
     path = os.path.join(os.path.dirname(__file__), TEMPLATE_FILE)
     if not os.path.isfile(path):
         raise ConversionError(f"找不到內建骨架模板：{path}")
-    requested = (SOURCE_TEMPLATE_NAME, TARGET_TEMPLATE_NAME)
     with bpy.data.libraries.load(path, link=False) as (data_from, data_to):
-        for name in requested:
-            if name not in data_from.objects:
-                raise ConversionError(f"骨架模板缺少物件：{name}")
-        data_to.objects = list(requested)
-    loaded = dict(zip(requested, data_to.objects))
-    for obj in loaded.values():
-        scene.collection.objects.link(obj)
-        obj.hide_render = True
-        obj.hide_set(True)
-    return loaded[SOURCE_TEMPLATE_NAME], loaded[TARGET_TEMPLATE_NAME]
+        if SOURCE_TEMPLATE_NAME not in data_from.objects:
+            raise ConversionError(f"骨架模板缺少物件：{SOURCE_TEMPLATE_NAME}")
+        data_to.objects = [SOURCE_TEMPLATE_NAME]
+    source = data_to.objects[0]
+    scene.collection.objects.link(source)
+    source.hide_render = True
+    source.hide_set(True)
+    return source
 
 
 def _remove_object(obj):
@@ -203,6 +329,95 @@ def _remove_object(obj):
     bpy.data.objects.remove(obj, do_unlink=True)
     if data and data.users == 0 and data.name in bpy.data.armatures:
         bpy.data.armatures.remove(data)
+
+
+def _escaped_bone_name(name):
+    return name.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _bone_data_path(name, suffix):
+    return f'pose.bones["{_escaped_bone_name(name)}"].{suffix}'
+
+
+def _source_alias_index(source):
+    normalized = {}
+
+    def add(alias, source_name):
+        if source_name not in source.pose.bones:
+            return
+        key = _normalize_bone_name(alias)
+        if key:
+            normalized.setdefault(key, set()).add(source_name)
+
+    for pose_bone in source.pose.bones:
+        add(pose_bone.name, pose_bone.name)
+    for canonical, aliases in BONE_ALIASES.items():
+        for alias in aliases:
+            add(alias, canonical)
+    for source_name, aliases in SOURCE_BONE_ALIASES.items():
+        for alias in aliases:
+            add(alias, source_name)
+    return normalized
+
+
+def _resolve_target_source_map(source, target, bone_map):
+    result = {actual: canonical for canonical, actual in bone_map.items()}
+    normalized = _source_alias_index(source)
+    for pose_bone in target.pose.bones:
+        if pose_bone.name in result:
+            continue
+        if pose_bone.name in source.pose.bones:
+            result[pose_bone.name] = pose_bone.name
+            continue
+        name_j, name_e = _mmd_names(pose_bone)
+        candidates = set()
+        for label in (pose_bone.name, name_j, name_e):
+            candidates.update(normalized.get(_normalize_bone_name(label), set()))
+        if len(candidates) == 1:
+            result[pose_bone.name] = next(iter(candidates))
+    return result
+
+
+def _remap_source_action(source_action, source, target, bone_map):
+    exact = {pose_bone.name: pose_bone.name for pose_bone in source.pose.bones}
+    for canonical, actual_name in bone_map.items():
+        exact[actual_name] = canonical
+
+    normalized = _source_alias_index(source)
+
+    def add_alias(alias, source_name):
+        key = _normalize_bone_name(alias)
+        if key and source_name in source.pose.bones:
+            normalized.setdefault(key, set()).add(source_name)
+
+    for canonical, actual_name in bone_map.items():
+        add_alias(actual_name, canonical)
+        pose_bone = target.pose.bones[actual_name]
+        name_j, name_e = _mmd_names(pose_bone)
+        add_alias(name_j, canonical)
+        add_alias(name_e, canonical)
+
+    remapped = 0
+    unresolved = set()
+    pattern = re.compile(r'^pose\.bones\["(.*)"\](\..+)$')
+    for curve in source_action.fcurves:
+        match = pattern.match(curve.data_path)
+        if not match:
+            continue
+        action_bone_name, suffix = match.groups()
+        source_name = exact.get(action_bone_name)
+        if source_name is None:
+            candidates = normalized.get(_normalize_bone_name(action_bone_name), set())
+            if len(candidates) == 1:
+                source_name = next(iter(candidates))
+        if source_name is None:
+            unresolved.add(action_bone_name)
+            continue
+        new_path = _bone_data_path(source_name, suffix[1:])
+        if curve.data_path != new_path:
+            curve.data_path = new_path
+            remapped += 1
+    return remapped, tuple(sorted(unresolved))
 
 
 def _write_curve(action, data_path, array_index, group_name, frames, values):
@@ -220,43 +435,44 @@ def _write_curve(action, data_path, array_index, group_name, frames, values):
     curve.update()
 
 
-def _make_action(name, frames, channels):
+def _make_action(name, frames, channels, bone_map):
     action = bpy.data.actions.new(name)
     action.use_fake_user = True
     try:
-        for bone_name in OUTPUT_BONES:
-            loc_path = f'pose.bones["{bone_name}"].location'
-            quat_path = f'pose.bones["{bone_name}"].rotation_quaternion'
+        for bone_name in _mapped_output_bones(bone_map):
+            actual_name = bone_map[bone_name]
+            loc_path = _bone_data_path(actual_name, "location")
+            quat_path = _bone_data_path(actual_name, "rotation_quaternion")
             for index in range(3):
-                _write_curve(action, loc_path, index, bone_name, frames, channels[bone_name]["loc"][index])
+                _write_curve(action, loc_path, index, actual_name, frames, channels[bone_name]["loc"][index])
             for index in range(4):
-                _write_curve(action, quat_path, index, bone_name, frames, channels[bone_name]["quat"][index])
+                _write_curve(action, quat_path, index, actual_name, frames, channels[bone_name]["quat"][index])
         return action
     except Exception:
         bpy.data.actions.remove(action)
         raise
 
 
-def _make_lower_action(name, frames, lower_channels):
+def _make_lower_action(name, frames, lower_channels, lower_body_name):
     action = bpy.data.actions.new(name)
     action.use_fake_user = True
     try:
-        loc_path = 'pose.bones["LowerBody"].location'
-        quat_path = 'pose.bones["LowerBody"].rotation_quaternion'
+        loc_path = _bone_data_path(lower_body_name, "location")
+        quat_path = _bone_data_path(lower_body_name, "rotation_quaternion")
         for index in range(3):
-            _write_curve(action, loc_path, index, "LowerBody", frames, lower_channels["loc"][index])
+            _write_curve(action, loc_path, index, lower_body_name, frames, lower_channels["loc"][index])
         for index in range(4):
-            _write_curve(action, quat_path, index, "LowerBody", frames, lower_channels["quat"][index])
+            _write_curve(action, quat_path, index, lower_body_name, frames, lower_channels["quat"][index])
         return action
     except Exception:
         bpy.data.actions.remove(action)
         raise
 
 
-def _capture_channels(context, source, target, frames):
+def _capture_channels(context, source, target, frames, bone_map, target_source_map):
     channels = {
         name: {"loc": [[], [], []], "quat": [[], [], [], []]}
-        for name in OUTPUT_BONES
+        for name in _mapped_output_bones(bone_map)
     }
     lower_channels = {"loc": [[], [], []], "quat": [[], [], [], []]}
     previous_quat = {}
@@ -272,12 +488,30 @@ def _capture_channels(context, source, target, frames):
 
         source_pose = {bone.name: bone.matrix.copy() for bone in source.pose.bones}
         desired_pose = {}
-        for target_bone in target.data.bones:
-            if target_bone.name in source_pose and target_bone.name in source.data.bones:
-                source_rest = source.data.bones[target_bone.name].matrix_local
-                desired_pose[target_bone.name] = (
-                    target_bone.matrix_local @ source_rest.inverted() @ source_pose[target_bone.name]
+
+        def desired_for(target_bone):
+            cached = desired_pose.get(target_bone.name)
+            if cached is not None:
+                return cached
+            source_name = target_source_map.get(target_bone.name)
+            if source_name is not None:
+                source_rest = source.data.bones[source_name].matrix_local
+                desired = (
+                    target_bone.matrix_local
+                    @ source_rest.inverted()
+                    @ source_pose[source_name]
                 )
+            elif target_bone.parent:
+                parent_desired = desired_for(target_bone.parent)
+                parent_rest = target_bone.parent.matrix_local
+                desired = parent_desired @ parent_rest.inverted() @ target_bone.matrix_local
+            else:
+                desired = target_bone.matrix_local.copy()
+            desired_pose[target_bone.name] = desired
+            return desired
+
+        for target_bone in target.data.bones:
+            desired_for(target_bone)
 
         lower_matrix = source_pose["LowerBody"]
         lower_loc, lower_quat, lower_scale = lower_matrix.decompose()
@@ -291,13 +525,16 @@ def _capture_channels(context, source, target, frames):
         lower_rebuilt = Matrix.LocRotScale(lower_loc, lower_quat, Vector((1.0, 1.0, 1.0)))
         max_lower_matrix_error = max(max_lower_matrix_error, _matrix_error(lower_matrix, lower_rebuilt))
 
-        for bone_name in OUTPUT_BONES:
-            target_bone = target.data.bones[bone_name]
-            desired = desired_pose[bone_name]
+        for bone_name in _mapped_output_bones(bone_map):
+            actual_name = bone_map[bone_name]
+            target_bone = target.data.bones[actual_name]
+            desired = desired_pose[actual_name]
             if target_bone.parent:
                 parent_name = target_bone.parent.name
                 if parent_name not in desired_pose:
-                    raise ConversionError(f"無法反解 {bone_name}：缺少父骨 {parent_name} 的來源姿勢。")
+                    raise ConversionError(
+                        f"無法反解 {bone_name}（{actual_name}）：缺少父骨 {parent_name} 的姿勢。"
+                    )
                 basis = target_bone.convert_local_to_pose(
                     desired,
                     target_bone.matrix_local,
@@ -314,7 +551,7 @@ def _capture_channels(context, source, target, frames):
             scale_error = max(abs(float(component) - 1.0) for component in scale)
             if scale_error > max_basis_scale_error:
                 max_basis_scale_error = scale_error
-                worst_scale = (frame, bone_name)
+                worst_scale = (frame, f"{bone_name}({actual_name})")
             if bone_name in previous_quat and previous_quat[bone_name].dot(quat) < 0.0:
                 quat.negate()
             previous_quat[bone_name] = quat.copy()
@@ -333,10 +570,10 @@ def _capture_channels(context, source, target, frames):
     return channels, lower_channels, max_basis_scale_error, max_lower_matrix_error
 
 
-def _validate_result(context, source, target, output_action, frames):
+def _validate_result(context, source, target, output_action, frames, bone_map):
     target.animation_data_create()
     target.animation_data.action = output_action
-    _disable_leg_ik(target)
+    _disable_leg_ik(target, bone_map)
     max_matrix_error = 0.0
     max_translation_error = 0.0
     worst_matrix = (None, None)
@@ -347,24 +584,25 @@ def _validate_result(context, source, target, output_action, frames):
     for index, frame in enumerate(frames):
         context.scene.frame_set(frame)
         context.view_layer.update()
-        _assert_leg_ik_off(target, frame)
-        for bone_name in OUTPUT_BONES:
+        _assert_leg_ik_off(target, bone_map, frame)
+        for bone_name in _mapped_output_bones(bone_map):
             source_bone = source.data.bones[bone_name]
-            target_bone = target.data.bones[bone_name]
+            actual_name = bone_map[bone_name]
+            target_bone = target.data.bones[actual_name]
             expected = (
                 target_bone.matrix_local
                 @ source_bone.matrix_local.inverted()
                 @ source.pose.bones[bone_name].matrix
             )
-            actual = target.pose.bones[bone_name].matrix
+            actual = target.pose.bones[actual_name].matrix
             matrix_error = _matrix_error(expected, actual)
             translation_error = _matrix_translation_error(expected, actual)
             if matrix_error > max_matrix_error:
                 max_matrix_error = matrix_error
-                worst_matrix = (frame, bone_name)
+                worst_matrix = (frame, f"{bone_name}({actual_name})")
             if translation_error > max_translation_error:
                 max_translation_error = translation_error
-                worst_translation = (frame, bone_name)
+                worst_translation = (frame, f"{bone_name}({actual_name})")
         window_manager.progress_update(offset + index + 1)
 
     if max_matrix_error > MATRIX_GATE:
@@ -406,60 +644,89 @@ def convert_action(context, target, input_action, output_name):
     input_digest_before = _action_digest(input_action)
     input_action.use_fake_user = True
     source = None
-    template_target = None
     source_action = None
     output_action = None
     lower_action = None
-    original_leg_ik_influences = [
-        (constraint, float(constraint.influence))
-        for _bone_name, constraint in _leg_ik_constraints(target)
-    ]
+    bone_map = None
+    original_leg_ik_influences = []
+    original_rotation_modes = []
     start_time = time.monotonic()
     context.window_manager.progress_begin(0, len(frames) * 2)
 
     try:
-        source, template_target = _append_templates(scene)
+        source = _append_source_template(scene)
         source.hide_set(False)
         source.matrix_world = target.matrix_world.copy()
-        template_target.matrix_world = target.matrix_world.copy()
-        disabled_leg_ik_constraints = _disable_leg_ik(target)
-        max_rest_error = _validate_target(target, template_target)
+        bone_map, mapping_sources = _resolve_bone_map(target)
+        original_leg_ik_influences = [
+            (constraint, float(constraint.influence))
+            for _canonical, _bone_name, constraint in _leg_ik_constraints(target, bone_map)
+        ]
+        original_rotation_modes = _set_quaternion_modes(target, bone_map)
+        disabled_leg_ik_constraints = _disable_leg_ik(target, bone_map)
 
-        missing_source = [name for name in OUTPUT_BONES if name not in source.pose.bones]
+        missing_source = [
+            name for name in _mapped_output_bones(bone_map)
+            if name not in source.pose.bones
+        ]
         if missing_source:
             raise ConversionError("來源模板缺少輸出骨骼：" + ", ".join(missing_source))
 
         source_action = input_action.copy()
         source_action.name = f"__PJSK_SOURCE_{input_action.name}__"
+        remapped_curves, unresolved_action_bones = _remap_source_action(
+            source_action, source, target, bone_map
+        )
         source.animation_data_create()
         source.animation_data.action = source_action
 
+        target_source_map = _resolve_target_source_map(source, target, bone_map)
         channels, lower_channels, max_scale_error, max_lower_error = _capture_channels(
-            context, source, target, frames
+            context, source, target, frames, bone_map, target_source_map
         )
-        lower_action = _make_lower_action(lower_name, frames, lower_channels)
-        output_action = _make_action(output_name, frames, channels)
+        lower_action = _make_lower_action(
+            lower_name, frames, lower_channels, bone_map["LowerBody"]
+        )
+        output_action = _make_action(output_name, frames, channels, bone_map)
 
         max_matrix_error, max_translation_error, worst_matrix, worst_translation = _validate_result(
-            context, source, target, output_action, frames
+            context, source, target, output_action, frames, bone_map
         )
         input_digest_after = _action_digest(input_action)
         if input_digest_after != input_digest_before:
             raise ConversionError("來源 Action digest 改變；輸出已取消。")
 
         elapsed = time.monotonic() - start_time
+        mapping_source_counts = {
+            source_name: sum(1 for value in mapping_sources.values() if value == source_name)
+            for source_name in ("骨名", "MMD日文名", "MMD英文名")
+        }
         _write_report(output_name, {
             "input_action": input_action.name,
             "output_action": output_action.name,
             "lowerbody_world_bake": lower_action.name,
             "frames": f"{frame_start}-{frame_end}",
             "frame_count": len(frames),
-            "output_bones": len(OUTPUT_BONES),
+            "output_bones": len(bone_map),
+            "optional_bones_skipped": ",".join(
+                name for name in OUTPUT_BONES if name not in bone_map
+            ) or "NONE",
             "output_fcurves": len(output_action.fcurves),
             "output_keys": sum(len(fc.keyframe_points) for fc in output_action.fcurves),
             "source_digest_before": input_digest_before,
             "source_digest_after": input_digest_after,
-            "max_rest_matrix_error": max_rest_error,
+            "target_rest_pose": "使用目標模型實際 Rest Matrix",
+            "bone_mapping_count": len(bone_map),
+            "hierarchy_bones_mapped": len(target_source_map),
+            "bone_mapping_sources": ",".join(
+                f"{key}:{value}" for key, value in mapping_source_counts.items()
+            ),
+            "bone_mapping": ";".join(
+                f"{canonical}->{bone_map[canonical]}"
+                for canonical in _mapped_output_bones(bone_map)
+            ),
+            "source_action_curves_remapped": remapped_curves,
+            "source_action_unresolved_bones": ",".join(unresolved_action_bones) or "NONE",
             "max_lowerbody_matrix_error": max_lower_error,
             "max_output_matrix_error": max_matrix_error,
             "max_output_translation_error": max_translation_error,
@@ -470,6 +737,7 @@ def convert_action(context, target, input_action, output_name):
             "ik_curves": 0,
             "leg_ik_state": "OFF",
             "leg_ik_constraints_disabled": disabled_leg_ik_constraints,
+            "rotation_modes_changed_to_quaternion": len(original_rotation_modes),
             "elapsed_seconds": round(elapsed, 3),
         })
         target.animation_data.action = output_action
@@ -479,6 +747,8 @@ def convert_action(context, target, input_action, output_name):
             target.animation_data.action = original_target_action
         for constraint, influence in original_leg_ik_influences:
             constraint.influence = influence
+        for pose_bone, rotation_mode in original_rotation_modes:
+            pose_bone.rotation_mode = rotation_mode
         for action in (output_action, lower_action):
             if action and action.name in bpy.data.actions:
                 bpy.data.actions.remove(action)
@@ -490,8 +760,6 @@ def convert_action(context, target, input_action, output_name):
             if source.animation_data:
                 source.animation_data.action = None
             _remove_object(source)
-        if template_target:
-            _remove_object(template_target)
         if source_action and source_action.name in bpy.data.actions:
             bpy.data.actions.remove(source_action)
 
@@ -509,14 +777,19 @@ class PJSK_TDA_OT_convert(bpy.types.Operator):
     def _resolve_target(context):
         if context.object is not None and context.object.type == "ARMATURE":
             return context.object
-        candidates = [
-            obj for obj in context.scene.objects
-            if obj.type == "ARMATURE" and all(name in obj.pose.bones for name in OUTPUT_BONES)
-        ]
+        candidates = []
+        for obj in context.scene.objects:
+            if obj.type != "ARMATURE":
+                continue
+            try:
+                _resolve_bone_map(obj)
+            except ConversionError:
+                continue
+            candidates.append(obj)
         if len(candidates) == 1:
             return candidates[0]
         if not candidates:
-            raise ConversionError("找不到可用的 TDA 骨架；請先匯入模型。")
+            raise ConversionError("找不到具備必要語意骨的 TDA 骨架；請先匯入模型。")
         raise ConversionError("場景中有多個 TDA 骨架；請選取要轉換的骨架。")
 
     def execute(self, context):
@@ -567,11 +840,12 @@ class PJSK_TDA_PT_panel(bpy.types.Panel):
         if target and target.type == "ARMATURE":
             layout.label(text=f"目標：{target.name}", icon="ARMATURE_DATA")
         else:
-            layout.label(text="未選取時會使用場景唯一的 TDA 骨架", icon="INFO")
+            layout.label(text="未選取時會自動辨識場景唯一的相容 TDA", icon="INFO")
         layout.prop(context.scene, "pjsk_tda_input_action", text="輸入 Action")
         layout.prop(context.scene, "pjsk_tda_output_name", text="輸出名稱")
         layout.operator(PJSK_TDA_OT_convert.bl_idname, icon="ACTION")
         layout.separator()
+        layout.label(text="支援常見英／日骨名與不同 Rest Pose", icon="CHECKMARK")
         layout.label(text="會自動關閉左右腿與腳尖 IK", icon="CHECKMARK")
         layout.label(text="原 Action 不會被修改")
         layout.label(text="不新增 IK／不建立 Scale 曲線")
