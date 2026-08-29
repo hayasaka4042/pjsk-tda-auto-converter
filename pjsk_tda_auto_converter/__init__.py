@@ -1,6 +1,6 @@
 bl_info = {
     "name": "PJSK to TDA Auto Converter",
-    "author": "Codex",
+    "author": "hayasaka4042-cpu",
     "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > PJSK→TDA",
