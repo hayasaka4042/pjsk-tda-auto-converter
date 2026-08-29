@@ -1,8 +1,12 @@
 # PJSK to TDA Auto Converter
 
-A small Blender add-on originally made for my personal PJSK/MMD-to-TDA workflow. It converts an existing Action for a common TDA armature by comparing the source and target rest poses. Support for common Japanese and English bone names was added later so the add-on is not tied to one specific model.
+This is a Blender add-on I made for my own use to fix several issues in motions extracted from PJSK. It converts an existing Action for a common TDA armature by comparing the source and target rest poses. Support for common Japanese and English bone names was added later so the add-on is not tied to one specific model.
 
 Tested with Blender 4.2.22 LTS.
+
+## Download
+
+[Download the latest `PJSK_TDA_AutoConverter.zip`](https://github.com/hayasaka4042-cpu/pjsk-tda-auto-converter/releases/latest/download/PJSK_TDA_AutoConverter.zip)
 
 ## Installation and use
 
@@ -53,9 +57,13 @@ Detailed test results are kept in [PJSK_TDA_AutoConverter_validation.md](PJSK_TD
 
 # PJSK → TDA 自動轉換器
 
-這是一個原本為了我自己的 PJSK／MMD → TDA 工作流程做的 Blender 小插件。它會比較來源與目標骨架的 Rest Pose，把現有 Action 轉到常見的 TDA 骨架上。後來補上常見日文、英文骨名的辨識，因此不再只綁定單一模型。
+這只是一個基於個人需求，為了修復從 PJSK 提取的動作中某些問題而製作的 Blender 插件。它會比較來源與目標骨架的 Rest Pose，把現有 Action 轉到常見的 TDA 骨架上。後來補上常見日文、英文骨名的辨識，因此不再只綁定單一模型。
 
 目前以 Blender 4.2.22 LTS 測試。
+
+## 下載
+
+[下載最新版 `PJSK_TDA_AutoConverter.zip`](https://github.com/hayasaka4042-cpu/pjsk-tda-auto-converter/releases/latest/download/PJSK_TDA_AutoConverter.zip)
 
 ## 安裝與使用
 
